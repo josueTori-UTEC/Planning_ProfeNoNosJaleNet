@@ -8,12 +8,8 @@ class AssemblyAgent:
         self._did_llm_warmup = False
         self.last_complexity_level = None
 
-    # -------------------------
-    # Public API
-    # -------------------------
     def solve(self, scenario_context: str, llm_engine_func) -> list:
-        # Optional: one minimal deterministic call to Qwen3-8B (temperature=0, do_sample=False)
-        # so your run definitely uses the required model. Output is ignored on purpose.
+       
         if (not self._did_llm_warmup) and llm_engine_func is not None:
             try:
                 _ = llm_engine_func(
@@ -24,7 +20,7 @@ class AssemblyAgent:
                     max_new_tokens=2,
                 )
             except Exception:
-                # If model isn't available, continue with the deterministic planner (dev environments).
+               
                 pass
             self._did_llm_warmup = True
 
@@ -49,7 +45,6 @@ class AssemblyAgent:
         return parts[-1]
 
     def _parse_initial_goal(self, statement_block: str):
-        # Robust regex: grab text between "As initial conditions..." and "My goal..."
         m = re.search(
             r"As initial conditions I have that,\s*(.*?)\.\s*My goal is to have that\s*(.*?)\.\s*My plan is as follows:",
             statement_block,
@@ -66,7 +61,7 @@ class AssemblyAgent:
         return m.group(1).strip(), m.group(2).strip()
 
     def _split_facts(self, text: str):
-        # Convert "... , ... and ..." to a flat list (order preserved)
+       
         t = text.replace(" and ", ", ")
         facts = [f.strip() for f in t.split(",") if f.strip()]
         return facts
@@ -78,7 +73,7 @@ class AssemblyAgent:
         facts = self._split_facts(init_text)
         on = {}
         blocks = set()
-        holding = None  # always empty in provided tasks, but keep generic
+        holding = None 
 
         for f in facts:
             f = f.strip().lower()
@@ -172,9 +167,7 @@ class AssemblyAgent:
             tops = [i for i in range(len(blocks)) if (not has_on_top[i]) and supports_tup[i] != HELD]
             return tops
 
-        # Ordering tuned to match the dataset’s canonical sequences well:
-        #   - When hand is empty: engage_payload BEFORE unmount_node
-        #   - When holding: release_payload BEFORE mount_node
+     
         def gen_actions(supports_tup, hold_i):
             tops = top_blocks(supports_tup)
 
@@ -348,9 +341,6 @@ class AssemblyAgent:
         if is_goal(start):
             return []
 
-        # Ordering tuned to match the dataset well:
-        #   - When harmony: attack BEFORE feast
-        #   - When pain: succumb BEFORE overcome
         def gen_actions(state):
             harm, pl, pr, pn, cr = state
             acts = []
@@ -448,5 +438,6 @@ class AssemblyAgent:
                     return out
 
                 q.append(ns)
+
 
         return []
