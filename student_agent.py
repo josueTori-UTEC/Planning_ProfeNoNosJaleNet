@@ -1,443 +1,142 @@
+import json
 import re
-from collections import deque
 
 class AssemblyAgent:
-
-
     def __init__(self):
-        self._did_llm_warmup = False
-        self.last_complexity_level = None
+        self._re_init_goal = re.compile(
+            r"As initial conditions I have that,\s*(.*?)\.\s*My goal is to have that\s*(.*?)\.\s*My plan is as follows:",
+            re.S | re.I
+        )
+
+        self.system_blocks = (
+            "You are a deterministic planner. Temperature=0, greedy decoding.\n"
+            "Return ONLY a JSON array of action strings.\n"
+            "Find the SHORTEST plan. If multiple shortest plans exist, break ties by BFS expansion order.\n\n"
+            "DOMAIN: BLOCKS\n"
+            "Canonical action syntax (must match exactly):\n"
+            '- "(engage_payload X)"\n'
+            '- "(release_payload X)"\n'
+            '- "(unmount_node X Y)"\n'
+            '- "(mount_node X Y)"\n'
+            "Use lowercase action names. X,Y are block names (e.g., red, blue, orange, yellow).\n"
+            "Each action string must have exactly one space between tokens and be wrapped in parentheses.\n\n"
+            "State concepts:\n"
+            "- hand_empty, holding(X), on(X,table) or on(X,Y), clear(X).\n\n"
+            "Action rules:\n"
+            "1) engage_payload X (pick up): pre hand_empty & on(X,table) & clear(X). eff holding(X) & not hand_empty.\n"
+            "2) release_payload X (put down): pre holding(X). eff on(X,table) & hand_empty.\n"
+            "3) unmount_node X Y (unstack): pre hand_empty & on(X,Y) & clear(X). eff holding(X) & clear(Y).\n"
+            "4) mount_node X Y (stack): pre holding(X) & clear(Y). eff on(X,Y) & hand_empty & not clear(Y).\n\n"
+            "BFS tie-break action order (very important):\n"
+            "- If hand_empty: list all unmount_node actions first (sort by X then Y), then engage_payload actions (sort by X).\n"
+            "- If holding(X): list all mount_node actions first (sort by Y), then release_payload.\n\n"
+            "Output format example:\n"
+            '["(unmount_node red blue)", "(release_payload red)"]\n'
+            "No extra text."
+        )
+
+        self.system_objects = (
+            "You are a deterministic planner. Temperature=0, greedy decoding.\n"
+            "Return ONLY a JSON array of action strings.\n"
+            "Find the SHORTEST plan. If multiple shortest plans exist, break ties by BFS expansion order.\n\n"
+            "DOMAIN: OBJECTS\n"
+            "Canonical action syntax (must match exactly):\n"
+            '- "(attack x)"\n'
+            '- "(feast x y)"\n'
+            '- "(succumb x)"\n'
+            '- "(overcome x y)"\n'
+            "Use lowercase action names. x,y are object ids (e.g., a,b,c).\n"
+            "Each action string must have exactly one space between tokens and be wrapped in parentheses.\n\n"
+            "Facts:\n"
+            "- harmony (boolean)\n"
+            "- province(x), planet(x), pain(x)\n"
+            "- craves(x,y)\n\n"
+            "Action rules:\n"
+            "1) attack(x): pre harmony & province(x) & planet(x). eff pain(x). del harmony, province(x), planet(x).\n"
+            "2) succumb(x): pre pain(x). eff harmony, province(x), planet(x). del pain(x).\n"
+            "3) feast(x,y): pre harmony & province(x) & craves(x,y). eff pain(x), province(y). del harmony, province(x), craves(x,y).\n"
+            "4) overcome(x,y): pre pain(x) & province(y). eff harmony, province(x), craves(x,y). del province(y), pain(x).\n\n"
+            "BFS tie-break action order (very important):\n"
+            "- If any pain(.) is true: consider succumb(x) first (sort by x), then overcome(x,y) (sort by x then y).\n"
+            "- Else (no pain) and harmony is true: consider feast(x,y) first (sort by x then y), then attack(x) (sort by x).\n\n"
+            "Output format example:\n"
+            '["(feast a b)", "(succumb a)"]\n'
+            "No extra text."
+        )
 
     def solve(self, scenario_context: str, llm_engine_func) -> list:
-       
-        if (not self._did_llm_warmup) and llm_engine_func is not None:
-            try:
-                _ = llm_engine_func(
-                    prompt="Reply with OK.",
-                    system="You are a deterministic assistant. Reply only with OK.",
-                    temperature=0.0,
-                    do_sample=False,
-                    max_new_tokens=2,
-                )
-            except Exception:
-               
-                pass
-            self._did_llm_warmup = True
+        stmt = self._second_statement(scenario_context)
+        init_text, goal_text = self._extract_init_goal(stmt)
 
-        stmt = self._extract_second_statement(scenario_context)
-        init_text, goal_text = self._parse_initial_goal(stmt)
+        is_blocks = ("set of blocks" in scenario_context.lower())
+        system = self.system_blocks if is_blocks else self.system_objects
 
-        if "set of blocks" in scenario_context.lower():
-            plan = self._solve_blocks(init_text, goal_text)
-        else:
-            plan = self._solve_objects(init_text, goal_text)
+        user_prompt = (
+            "INITIAL:\n" + init_text + "\n\n"
+            "GOAL:\n" + goal_text + "\n\n"
+            "Return ONLY the JSON array."
+        )
 
-        self.last_complexity_level = len(plan)
+        out = llm_engine_func(
+            prompt=user_prompt,
+            system=system,
+            temperature=0.0,
+            do_sample=False,
+            max_new_tokens=220
+        )
+
+        plan = self._parse_json_array(out, llm_engine_func, system)
         return plan
 
-    # -------------------------
-    # Parsing helpers
-    # -------------------------
-    def _extract_second_statement(self, context: str) -> str:
+    def _second_statement(self, context: str) -> str:
         parts = context.split("[STATEMENT]")
-        if len(parts) < 2:
-            raise ValueError("No [STATEMENT] blocks found.")
-        return parts[-1]
+        return parts[-1] if len(parts) > 1 else context
 
-    def _parse_initial_goal(self, statement_block: str):
-        m = re.search(
-            r"As initial conditions I have that,\s*(.*?)\.\s*My goal is to have that\s*(.*?)\.\s*My plan is as follows:",
-            statement_block,
-            re.S | re.I,
-        )
+    def _extract_init_goal(self, stmt: str):
+        m = self._re_init_goal.search(stmt)
         if not m:
-            m = re.search(
-                r"As initial conditions I have that,\s*(.*?)\nMy goal is to have that\s*(.*?)\n\nMy plan is as follows:",
-                statement_block,
-                re.S | re.I,
-            )
-        if not m:
-            raise ValueError("Could not parse initial conditions / goal.")
+            raise ValueError("No se pudo parsear initial/goal del segundo [STATEMENT].")
         return m.group(1).strip(), m.group(2).strip()
 
-    def _split_facts(self, text: str):
-       
-        t = text.replace(" and ", ", ")
-        facts = [f.strip() for f in t.split(",") if f.strip()]
-        return facts
-
-    # -------------------------
-    # Domain 1: Blocks world
-    # -------------------------
-    def _parse_blocks_init(self, init_text: str):
-        facts = self._split_facts(init_text)
-        on = {}
-        blocks = set()
-        holding = None 
-
-        for f in facts:
-            f = f.strip().lower()
-            if f == "the hand is empty":
-                holding = None
-                continue
-
-            m = re.match(r"the (\w+) block is on top of the (\w+) block", f)
-            if m:
-                a, b = m.group(1), m.group(2)
-                on[a] = b
-                blocks.update([a, b])
-                continue
-
-            m = re.match(r"the (\w+) block is on the table", f)
-            if m:
-                a = m.group(1)
-                on[a] = "table"
-                blocks.add(a)
-                continue
-
-            m = re.match(r"the (\w+) block is unobstructed", f)
-            if m:
-                blocks.add(m.group(1))
-                continue
-
-        for b in blocks:
-            on.setdefault(b, "table")
-
-        return holding, on
-
-    def _parse_blocks_goal(self, goal_text: str):
-        facts = self._split_facts(goal_text)
-        goals = []
-        for f in facts:
-            f = f.strip().lower()
-            m = re.match(r"the (\w+) block is on top of the (\w+) block", f)
-            if m:
-                goals.append(("on", m.group(1), m.group(2)))
-                continue
-            m = re.match(r"the (\w+) block is on the table", f)
-            if m:
-                goals.append(("table", m.group(1), None))
-                continue
-        return goals
-
-    def _solve_blocks(self, init_text: str, goal_text: str):
-        holding, on_map = self._parse_blocks_init(init_text)
-        goals = self._parse_blocks_goal(goal_text)
-
-        blocks = sorted(on_map.keys())
-        idx = {b: i for i, b in enumerate(blocks)}
-        TABLE = -1
-        HELD = -2
-        NONE = -1  # holding marker
-
-        supports = [TABLE] * len(blocks)
-        for b, sup in on_map.items():
-            i = idx[b]
-            if sup == "table":
-                supports[i] = TABLE
-            elif sup == "held":
-                supports[i] = HELD
-            else:
-                supports[i] = idx[sup]
-
-        hold = NONE if holding is None else idx[holding]
-
-        goal_checks = []
-        for t, a, b in goals:
-            if t == "on":
-                goal_checks.append((idx[a], idx[b]))
-            else:
-                goal_checks.append((idx[a], TABLE))
-
-        def is_goal(supports_tup, hold_i):
-            for a_i, sup_i in goal_checks:
-                if supports_tup[a_i] != sup_i:
-                    return False
-            return True
-
-        start = (tuple(supports), hold)
-        if is_goal(start[0], start[1]):
-            return []
-
-        def top_blocks(supports_tup):
-            has_on_top = [False] * len(blocks)
-            for i, sup in enumerate(supports_tup):
-                if sup >= 0:
-                    has_on_top[sup] = True
-            tops = [i for i in range(len(blocks)) if (not has_on_top[i]) and supports_tup[i] != HELD]
-            return tops
-
-     
-        def gen_actions(supports_tup, hold_i):
-            tops = top_blocks(supports_tup)
-
-            if hold_i == NONE:
-                engages = []
-                unmounts = []
-                for i in tops:
-                    sup = supports_tup[i]
-                    if sup == TABLE:
-                        engages.append(("engage_payload", i, None))
-                    elif sup >= 0:
-                        unmounts.append(("unmount_node", i, sup))
-                engages.sort(key=lambda a: blocks[a[1]])
-                unmounts.sort(key=lambda a: (blocks[a[1]], blocks[a[2]]))
-                return engages + unmounts
-
-            releases = [("release_payload", hold_i, None)]
-            mounts = []
-            for j in tops:
-                if j != hold_i:
-                    mounts.append(("mount_node", hold_i, j))
-            mounts.sort(key=lambda a: blocks[a[2]])
-            return releases + mounts
-
-        def apply_action(supports_tup, hold_i, act):
-            name, a, b = act
-            sup = list(supports_tup)
-
-            if name == "engage_payload":
-                sup[a] = HELD
-                return (tuple(sup), a)
-
-            if name == "unmount_node":
-                sup[a] = HELD
-                return (tuple(sup), a)
-
-            if name == "release_payload":
-                sup[a] = TABLE
-                return (tuple(sup), NONE)
-
-            if name == "mount_node":
-                sup[a] = b
-                return (tuple(sup), NONE)
-
-            raise ValueError("Unknown action")
-
-        q = deque([start])
-        parent = {start: None}
-        parent_act = {}
-
-        while q:
-            state = q.popleft()
-            supports_tup, hold_i = state
-
-            for act in gen_actions(supports_tup, hold_i):
-                nxt = apply_action(supports_tup, hold_i, act)
-                if nxt in parent:
+    def _parse_json_array(self, text: str, llm_engine_func, system: str):
+        s = text.strip()
+        l = s.find("[")
+        r = s.rfind("]")
+        if l != -1 and r != -1 and r > l:
+            s = s[l:r+1]
+        try:
+            arr = json.loads(s)
+            if not isinstance(arr, list):
+                raise ValueError("JSON no es lista")
+            arr2 = []
+            for a in arr:
+                if not isinstance(a, str):
                     continue
-                parent[nxt] = state
-                parent_act[nxt] = act
-
-                if is_goal(nxt[0], nxt[1]):
-                    out = []
-                    cur = nxt
-                    while parent[cur] is not None:
-                        name, a, b = parent_act[cur]
-                        if b is None:
-                            out.append(f"({name} {blocks[a]})")
-                        else:
-                            out.append(f"({name} {blocks[a]} {blocks[b]})")
-                        cur = parent[cur]
-                    out.reverse()
-                    return out
-
-                q.append(nxt)
-
-        return []
-
-    # -------------------------
-    # Domain 2: Objects world
-    # -------------------------
-    def _parse_objects_init(self, init_text: str):
-        facts = self._split_facts(init_text)
-        harmony = False
-        planet = set()
-        province = set()
-        pain = set()
-        craves = set()
-        objs = set()
-
-        for f in facts:
-            f = f.strip().lower()
-            if f == "harmony":
-                harmony = True
-                continue
-
-            m = re.match(r"planet object (\w+)", f)
-            if m:
-                o = m.group(1)
-                planet.add(o)
-                objs.add(o)
-                continue
-
-            m = re.match(r"province object (\w+)", f)
-            if m:
-                o = m.group(1)
-                province.add(o)
-                objs.add(o)
-                continue
-
-            m = re.match(r"pain object (\w+)", f)
-            if m:
-                o = m.group(1)
-                pain.add(o)
-                objs.add(o)
-                continue
-
-            m = re.match(r"object (\w+) craves object (\w+)", f)
-            if m:
-                a, b = m.group(1), m.group(2)
-                craves.add((a, b))
-                objs.update([a, b])
-                continue
-
-        return harmony, planet, province, pain, craves, objs
-
-    def _parse_objects_goal(self, goal_text: str):
-        facts = self._split_facts(goal_text)
-        goals = []
-        for f in facts:
-            f = f.strip().lower()
-            m = re.match(r"object (\w+) craves object (\w+)", f)
-            if m:
-                goals.append((m.group(1), m.group(2)))
-        return goals
-
-    def _solve_objects(self, init_text: str, goal_text: str):
-        harmony, planet_s, province_s, pain_s, craves_s, objs_s = self._parse_objects_init(init_text)
-        goals = self._parse_objects_goal(goal_text)
-        goal_set = set(goals)
-
-        objs = sorted(set(objs_s) | set([x for x, y in goal_set] + [y for x, y in goal_set]))
-        n = len(objs)
-        idx = {o: i for i, o in enumerate(objs)}
-
-        def bitset(items):
-            m = 0
-            for it in items:
-                if it in idx:
-                    m |= 1 << idx[it]
-            return m
-
-        planet = bitset(planet_s)
-        province = bitset(province_s)
-        pain = bitset(pain_s)
-
-        craves = 0
-        for a, b in craves_s:
-            if a in idx and b in idx:
-                craves |= 1 << (idx[a] * n + idx[b])
-
-        goal_mask = 0
-        for a, b in goal_set:
-            goal_mask |= 1 << (idx[a] * n + idx[b])
-
-        start = (harmony, planet, province, pain, craves)
-
-        def is_goal(state):
-            return (state[4] & goal_mask) == goal_mask
-
-        if is_goal(start):
-            return []
-
-        def gen_actions(state):
-            harm, pl, pr, pn, cr = state
-            acts = []
-
-            if harm:
-                # attack
-                for i in range(n):
-                    bit = 1 << i
-                    if (pr & bit) and (pl & bit):
-                        acts.append(("attack", i, None))
-                # feast
-                for i in range(n):
-                    bitx = 1 << i
-                    if not (pr & bitx):
-                        continue
-                    base = i * n
-                    for j in range(n):
-                        if cr & (1 << (base + j)):
-                            acts.append(("feast", i, j))
-
-            for i in range(n):
-                bitx = 1 << i
-                if pn & bitx:
-                    acts.append(("succumb", i, None))
-                    for j in range(n):
-                        bity = 1 << j
-                        if pr & bity:
-                            acts.append(("overcome", i, j))
-
-            return acts
-
-        def apply(state, act):
-            harm, pl, pr, pn, cr = state
-            name, i, j = act
-            bitx = 1 << i
-
-            if name == "attack":
-                pn |= bitx
-                pr &= ~bitx
-                pl &= ~bitx
-                harm = False
-                return (harm, pl, pr, pn, cr)
-
-            if name == "succumb":
-                pr |= bitx
-                pl |= bitx
-                pn &= ~bitx
-                harm = True
-                return (harm, pl, pr, pn, cr)
-
-            if name == "overcome":
-                bity = 1 << j
-                harm = True
-                pr |= bitx
-                cr |= 1 << (i * n + j)
-                pr &= ~bity
-                pn &= ~bitx
-                return (harm, pl, pr, pn, cr)
-
-            if name == "feast":
-                pn |= bitx
-                bity = 1 << j
-                pr |= bity
-                cr &= ~(1 << (i * n + j))
-                pr &= ~bitx
-                harm = False
-                return (harm, pl, pr, pn, cr)
-
-            raise ValueError("Unknown action")
-
-        q = deque([start])
-        parent = {start: None}
-        parent_act = {}
-
-        while q:
-            s = q.popleft()
-            for act in gen_actions(s):
-                ns = apply(s, act)
-                if ns in parent:
-                    continue
-                parent[ns] = s
-                parent_act[ns] = act
-
-                if is_goal(ns):
-                    out = []
-                    cur = ns
-                    while parent[cur] is not None:
-                        name, i, j = parent_act[cur]
-                        if j is None:
-                            out.append(f"({name} {objs[i]})")
-                        else:
-                            out.append(f"({name} {objs[i]} {objs[j]})")
-                        cur = parent[cur]
-                    out.reverse()
-                    return out
-
-                q.append(ns)
-
-
-        return []
+                a = a.strip()
+                if a.startswith("(") and a.endswith(")"):
+                    arr2.append(a)
+            return arr2
+        except Exception:
+            fix_prompt = (
+                "Fix the following into a VALID JSON array of action strings ONLY.\n"
+                "Do not add any explanations.\n\n"
+                "BROKEN_OUTPUT:\n"
+                + text.strip()
+            )
+            out2 = llm_engine_func(
+                prompt=fix_prompt,
+                system=system,
+                temperature=0.0,
+                do_sample=False,
+                max_new_tokens=220
+            )
+            s2 = out2.strip()
+            l2 = s2.find("[")
+            r2 = s2.rfind("]")
+            if l2 != -1 and r2 != -1 and r2 > l2:
+                s2 = s2[l2:r2+1]
+            arr = json.loads(s2)
+            if not isinstance(arr, list):
+                return []
+            return [x.strip() for x in arr if isinstance(x, str) and x.strip().startswith("(") and x.strip().endswith(")")]
+ 
